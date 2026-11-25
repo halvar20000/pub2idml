@@ -126,6 +126,22 @@ jobs:
           cp pyi/pub2idml dist/
           cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/
           ./dist/pub2idml --version
+      - name: Build pub2idml.app (drag and drop)
+        run: |
+          python -m pip install pillow
+          python mac/make_app.py --dist dist --out pub2idml.app --version "$(python pub2idml.py --version | cut -d' ' -f2)"
+          plutil -p pub2idml.app/Contents/Info.plist | head -40
+      - name: Test the app's conversion handler
+        run: |
+          # write the synthetic event stream from the unit tests and convert it through the droplet's AppleScript
+          python -c "import sys,json; sys.path.insert(0,'tests'); import test_pub2idml as t; open('/tmp/sample.jsonl','w').write(''.join(json.dumps(e)+chr(10) for e in t.EVENTS))"
+          BIN="$PWD/pub2idml.app/Contents/Resources/bin/"
+          osascript -e "set s to load script POSIX file \"$PWD/pub2idml.app/Contents/Resources/Scripts/main.scpt\"" \
+                    -e "tell s to return convertPaths({\"/tmp/sample.jsonl\", \"/tmp/\", \"/tmp/readme.txt\"}, \"$BIN\", false)"
+          test -s /tmp/sample.idml && unzip -l /tmp/sample.idml | tail -3
+          ditto -c -k --keepParent pub2idml.app pub2idml-app-macos-${{ matrix.arch }}.zip
+      - name: Package command-line zip
+        run: |
           mv dist pub2idml-macos-${{ matrix.arch }}
           # ditto keeps permissions and signatures inside the zip
           ditto -c -k --keepParent pub2idml-macos-${{ matrix.arch }} pub2idml-macos-${{ matrix.arch }}.zip
@@ -133,10 +149,14 @@ jobs:
         with:
           name: pub2idml-macos-${{ matrix.arch }}
           path: pub2idml-macos-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub2idml-app-macos-${{ matrix.arch }}
+          path: pub2idml-app-macos-${{ matrix.arch }}.zip
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes || true
-          gh release upload "$GITHUB_REF_NAME" pub2idml-macos-${{ matrix.arch }}.zip --clobber
+          gh release upload "$GITHUB_REF_NAME" pub2idml-macos-${{ matrix.arch }}.zip pub2idml-app-macos-${{ matrix.arch }}.zip --clobber

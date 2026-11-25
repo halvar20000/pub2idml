@@ -248,7 +248,7 @@ int run(int argc, char **argv)
   }
   if (!std::strcmp(argv[1], "--version"))
   {
-    std::printf("pub2json 0.2.0 (libmspub)\n");
+    std::printf("pub2json 0.3.0 (libmspub)\n");
     return 0;
   }
   std::vector<unsigned char> data;

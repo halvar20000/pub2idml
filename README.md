@@ -21,11 +21,22 @@ run and image as one JSON line; `pub2idml.py` turns that stream into an IDML pac
 
 Download from **[Releases](https://github.com/halvar20000/pub2idml/releases/latest)**:
 
+- `pub2idml-app-macos-arm64.zip` – **Mac app** for drag and drop (Apple Silicon, M1–M4)
+- `pub2idml-app-macos-x86_64.zip` – **Mac app** for drag and drop (Intel Mac)
 - `pub2idml-windows-x64.zip`
-- `pub2idml-macos-arm64.zip` (Apple Silicon, M1–M4)
-- `pub2idml-macos-x86_64.zip` (Intel Mac)
+- `pub2idml-macos-arm64.zip` / `pub2idml-macos-x86_64.zip` – command-line version for macOS
 
-Unzip and keep the folder together (`pub2idml` looks for `pub2json` next to itself).
+**Mac app:** unzip, move `pub2idml.app` to *Applications*, then drag `.pub` files or a folder onto
+the app icon (in Finder or the Dock). Or double-click the app and choose files. The `.idml` files
+are written next to the originals; a dialog shows the result and can reveal them in Finder.
+The app is not notarized by Apple, so the first time macOS refuses to open it: open
+*System Settings → Privacy & Security* and click **Open Anyway** – or once in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/pub2idml.app
+```
+
+**Command-line zips:** unzip and keep the folder together (`pub2idml` looks for `pub2json` next to itself).
 Python and LibreOffice are **not** required.
 
 **Windows:** drag one or more `.pub` files onto `pub2idml.exe` — the `.idml` is written next to
@@ -110,11 +121,23 @@ Form, jeden Text und jedes Bild als eine JSON-Zeile; `pub2idml.py` macht daraus 
 
 Download unter **[Releases](https://github.com/halvar20000/pub2idml/releases/latest)**:
 
+- `pub2idml-app-macos-arm64.zip` – **Mac-App** für Drag-and-Drop (Apple Silicon, M1–M4)
+- `pub2idml-app-macos-x86_64.zip` – **Mac-App** für Drag-and-Drop (Intel-Mac)
 - `pub2idml-windows-x64.zip`
-- `pub2idml-macos-arm64.zip` (Apple Silicon, M1–M4)
-- `pub2idml-macos-x86_64.zip` (Intel-Mac)
+- `pub2idml-macos-arm64.zip` / `pub2idml-macos-x86_64.zip` – Kommandozeilen-Version für macOS
 
-Zip entpacken, Ordner zusammenlassen (`pub2idml` sucht `pub2json` daneben). Python oder
+**Mac-App:** entpacken, `pub2idml.app` in den Ordner *Programme* ziehen, dann `.pub`-Dateien oder
+einen Ordner auf das App-Symbol ziehen (im Finder oder im Dock). Oder die App doppelklicken und
+Dateien auswählen. Die `.idml`-Dateien landen neben den Originalen; ein Fenster zeigt das Ergebnis
+und kann sie im Finder anzeigen. Die App ist nicht von Apple notarisiert, deshalb verweigert macOS
+beim ersten Mal das Öffnen: *Systemeinstellungen → Datenschutz & Sicherheit* öffnen und
+**Trotzdem öffnen** klicken – oder einmalig im Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/pub2idml.app
+```
+
+**Kommandozeilen-Zips:** entpacken, Ordner zusammenlassen (`pub2idml` sucht `pub2json` daneben). Python oder
 LibreOffice sind **nicht** nötig.
 
 **Windows:** eine oder mehrere `.pub`-Dateien einfach auf `pub2idml.exe` ziehen – die `.idml`

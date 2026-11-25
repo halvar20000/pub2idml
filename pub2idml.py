@@ -37,7 +37,7 @@ import zipfile
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape, quoteattr
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 PT_PER_UNIT = {"in": 72.0, "pt": 1.0, "twip": 1 / 20}
 
