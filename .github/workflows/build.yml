@@ -88,7 +88,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14        # Apple Silicon
+          - runner: macos-latest    # Apple Silicon
             arch: arm64
           - runner: macos-15-intel  # Intel
             arch: x86_64
@@ -96,6 +96,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: brew install libmspub dylibbundler pkg-config cmake
+      - name: Make keg-only ICU visible to pkg-config
+        run: |
+          for d in "$(brew --prefix)"/opt/icu4c*/lib/pkgconfig; do
+            [ -d "$d" ] && echo "PKG_CONFIG_PATH=$d:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV" && echo "using $d"
+          done
       - name: Build pub2json
         run: |
           cmake -S pub2json -B pub2json/build -DCMAKE_BUILD_TYPE=Release
