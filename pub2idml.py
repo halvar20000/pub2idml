@@ -966,14 +966,26 @@ def find_pub2json() -> str:
     found = shutil.which("pub2json")
     if found:
         return found
-    raise SystemExit("pub2json not found - build it from pub2json/ (see README) or put it next to pub2idml")
+    raise RuntimeError("pub2json not found - build it from pub2json/ (see README) or put it next to pub2idml")
+
+
+def system_env() -> dict:
+    """Environment for child processes: undo the library path a PyInstaller bundle sets for itself."""
+    env = dict(os.environ)
+    for var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        orig = env.pop(var + "_ORIG", None)
+        if orig is not None:
+            env[var] = orig
+        elif getattr(sys, "frozen", False):
+            env.pop(var, None)
+    return env
 
 
 def read_events(src: str) -> list:
     if src.lower().endswith((".jsonl", ".json")):
         with open(src, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
-    kwargs = {}
+    kwargs = {"env": system_env()}
     if os.name == "nt":
         kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     r = subprocess.run([find_pub2json(), src], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, **kwargs)
@@ -1040,6 +1052,187 @@ def main(argv=None):
     return 1 if failed else 0
 
 
+# --------------------------------------------------------------------------- #
+# Window mode (Windows app, Linux AppImage): drop files on the icon or choose them
+
+MESSAGES = {
+    "de": {
+        "choose": "Publisher-Dateien (.pub) zum Umwandeln in IDML auswählen",
+        "pubfiles": "Publisher-Dateien",
+        "allfiles": "Alle Dateien",
+        "none": "Keine .pub-Dateien gefunden.\n\nZiehen Sie Microsoft-Publisher-Dateien (.pub) oder einen Ordner "
+        "mit solchen Dateien auf das pub2idml-Symbol.",
+        "working": "Wandle um …",
+        "done": "{ok} von {n} Datei(en) umgewandelt.",
+        "next_to": "Die IDML-Dateien liegen neben den Originalen.",
+        "notes": "Hinweise: {w} (z. B. nicht unterstützte Elemente wie Tabellen).",
+        "errors": "Fehler:",
+        "skipped": "Übersprungen (keine .pub-Datei): {k}",
+        "reveal_win": "Im Explorer anzeigen?",
+        "reveal_other": "Im Dateimanager anzeigen?",
+    },
+    "en": {
+        "choose": "Choose Microsoft Publisher files (.pub) to convert to IDML",
+        "pubfiles": "Publisher files",
+        "allfiles": "All files",
+        "none": "No .pub files found.\n\nDrop Microsoft Publisher files (.pub), or a folder containing them, "
+        "on the pub2idml icon.",
+        "working": "Converting …",
+        "done": "{ok} of {n} file(s) converted.",
+        "next_to": "The IDML files are next to the originals.",
+        "notes": "Notes: {w} (e.g. unsupported elements such as tables).",
+        "errors": "Errors:",
+        "skipped": "Skipped (not a .pub file): {k}",
+        "reveal_win": "Show in Explorer?",
+        "reveal_other": "Show in file manager?",
+    },
+}
+
+
+def ui_language() -> str:
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
+        v = os.environ.get(var, "")
+        if v:
+            return "de" if v.lower().startswith("de") else "en"
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            return "de" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x07 else "en"
+        except Exception:
+            pass
+    return "en"
+
+
+def expand_inputs(paths) -> tuple[list[str], int]:
+    """Files and folders -> the .pub files to convert (folders: the .pub files directly inside)."""
+    files, skipped = [], 0
+    for p in paths:
+        if os.path.isdir(p):
+            files += sorted(os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(".pub"))
+        elif p.lower().endswith((".pub", ".jsonl")):
+            files.append(p)
+        else:
+            skipped += 1
+    return files, skipped
+
+
+def convert_many(files, progress=None) -> dict:
+    """Convert each file next to itself. progress(i, n, name) is called before each file."""
+    result = {"total": len(files), "converted": 0, "warnings": 0, "failures": [], "outputs": []}
+    for i, f in enumerate(files):
+        if progress:
+            progress(i, len(files), os.path.basename(f))
+        out = os.path.splitext(f)[0] + ".idml"
+        try:
+            result["warnings"] += len(convert(f, out))
+            result["converted"] += 1
+            result["outputs"].append(out)
+        except Exception as e:
+            lines = [l for l in str(e).splitlines() if l.strip()] or [type(e).__name__]
+            result["failures"].append(f"{os.path.basename(f)}: {lines[-1]}")
+    return result
+
+
+def reveal(path: str):
+    """Show a file in Explorer / the file manager."""
+    try:
+        if os.name == "nt":
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            uri = "file://" + os.path.abspath(path)
+            env = system_env()
+            r = subprocess.run(
+                ["gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1",
+                 "--object-path", "/org/freedesktop/FileManager1",
+                 "--method", "org.freedesktop.FileManager1.ShowItems", f"['{uri}']", ""],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+            ) if shutil.which("gdbus") else None
+            if r is None or r.returncode != 0:
+                subprocess.Popen(["xdg-open", os.path.dirname(os.path.abspath(path))], env=env)
+    except OSError:
+        pass
+
+
+def gui_main(paths) -> int:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    t = MESSAGES[ui_language()]
+    selftest = bool(os.environ.get("PUB2IDML_GUI_SELFTEST"))  # CI: run the window flow without dialogs
+    root = tk.Tk()
+    root.withdraw()
+    root.title("pub2idml")
+
+    if not paths:
+        picked = filedialog.askopenfilenames(
+            title=t["choose"], filetypes=[(t["pubfiles"], "*.pub *.PUB"), (t["allfiles"], "*")]
+        )
+        paths = list(picked)
+        if not paths:
+            root.destroy()
+            return 0
+
+    files, skipped = expand_inputs(paths)
+    if not files:
+        if not selftest:
+            messagebox.showwarning("pub2idml", t["none"])
+        root.destroy()
+        return 1
+
+    win = tk.Toplevel(root)
+    win.title("pub2idml")
+    win.resizable(False, False)
+    label = ttk.Label(win, text=t["working"], width=50)
+    label.pack(padx=16, pady=(16, 6))
+    bar = ttk.Progressbar(win, length=360, maximum=len(files))
+    bar.pack(padx=16, pady=(0, 16))
+    win.update()
+
+    def progress(i, n, name):
+        label.config(text=f"{t['working']}  {i + 1}/{n}  {name}")
+        bar["value"] = i
+        win.update()
+
+    r = convert_many(files, progress)
+    win.destroy()
+
+    msg = t["done"].format(ok=r["converted"], n=r["total"])
+    if r["converted"]:
+        msg += "\n" + t["next_to"]
+    if r["warnings"]:
+        msg += "\n\n" + t["notes"].format(w=r["warnings"])
+    if skipped:
+        msg += "\n\n" + t["skipped"].format(k=skipped)
+    if r["failures"]:
+        msg += "\n\n" + t["errors"] + "\n" + "\n".join("• " + f for f in r["failures"][:15])
+        if len(r["failures"]) > 15:
+            msg += f"\n• … (+{len(r['failures']) - 15})"
+
+    if selftest:
+        root.destroy()
+        return 0 if r["converted"] == r["total"] else 1
+    if r["converted"]:
+        ask = t["reveal_win"] if os.name == "nt" else t["reveal_other"]
+        icon = "warning" if r["failures"] else "info"
+        if messagebox.askyesno("pub2idml", msg + "\n\n" + ask, icon=icon):
+            reveal(r["outputs"][-1])
+    else:
+        messagebox.showerror("pub2idml", msg)
+    root.destroy()
+    return 0 if not r["failures"] else 1
+
+
+def wants_gui(argv) -> bool:
+    """--gui, or the window-mode build (pub2idml-app.exe)."""
+    if "--gui" in argv:
+        return True
+    name = os.path.basename(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).lower()
+    return name.startswith("pub2idml-app")
+
+
 def _own_console_on_windows() -> bool:
     """True when pub2idml.exe was started by double-click / drag-and-drop (it owns its console)."""
     if os.name != "nt" or not getattr(sys, "frozen", False):
@@ -1053,6 +1246,8 @@ def _own_console_on_windows() -> bool:
 
 
 if __name__ == "__main__":
+    if wants_gui(sys.argv[1:]):
+        sys.exit(gui_main([a for a in sys.argv[1:] if a != "--gui"]))
     pause = _own_console_on_windows()
     if pause and len(sys.argv) > 1 and all(a.lower().endswith(".pub") for a in sys.argv[1:]):
         # drag-and-drop of several files onto pub2idml.exe
@@ -1061,6 +1256,9 @@ if __name__ == "__main__":
             rc |= main([f, "-v"])
     else:
         rc = main()
-    if pause:
-        input("\nEnter druecken zum Beenden / press Enter to close ...")
+    if pause and sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input("\nEnter druecken zum Beenden / press Enter to close ...")
+        except EOFError:
+            pass
     sys.exit(rc)

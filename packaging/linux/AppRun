@@ -1,0 +1,9 @@
+#!/bin/sh
+# pub2idml AppImage entry point.
+#   from a terminal with arguments  -> command-line tool (pub2idml FILE.pub, --batch DIR, ...)
+#   double-click / drop on launcher -> window mode (file chooser, progress, result dialog)
+HERE="$(dirname "$(readlink -f "$0")")"
+if [ -n "$PUB2IDML_CLI" ] || { [ $# -gt 0 ] && [ -t 0 ]; }; then
+  exec "$HERE/usr/bin/pub2idml" "$@"
+fi
+exec "$HERE/usr/bin/pub2idml" --gui "$@"

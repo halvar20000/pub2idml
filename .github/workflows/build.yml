@@ -25,6 +25,65 @@ jobs:
           ./pub2json/build/pub2json --version
           python3 pub2idml.py --version
 
+  linux-appimage:
+    runs-on: ubuntu-22.04  # older glibc = runs on more distributions
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libmspub-dev librevenge-dev cmake pkg-config g++ libfuse2 xvfb libtk8.6 file
+      - name: Build pub2json
+        run: cmake -S pub2json -B pub2json/build -DCMAKE_BUILD_TYPE=Release && cmake --build pub2json/build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build pub2idml
+        run: |
+          python -m pip install --upgrade pip pyinstaller pillow
+          python -m unittest discover -s tests -v
+          python -c "import tkinter; print('tk', tkinter.TkVersion)"
+          pyinstaller --onefile --name pub2idml pub2idml.py
+          python packaging/icon.py --png pub2idml.png --size 256
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage
+          # pub2json and its libraries (libmspub, librevenge, ICU) with an rpath to usr/lib
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --executable pub2json/build/pub2json \
+            --desktop-file packaging/linux/pub2idml.desktop --icon-file pub2idml.png --custom-apprun packaging/linux/AppRun
+          # the PyInstaller binary is self-contained; add it after linuxdeploy so it is not patched
+          cp dist/pub2idml AppDir/usr/bin/
+          cp LICENSE THIRD_PARTY_NOTICES.md README.md AppDir/
+          find AppDir -maxdepth 3 | sort
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir pub2idml-x86_64.AppImage
+      - name: Test AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          python -c "import sys,json; sys.path.insert(0,'tests'); import test_pub2idml as t; open('/tmp/sample.jsonl','w').write(''.join(json.dumps(e)+chr(10) for e in t.EVENTS))"
+          cp /tmp/sample.jsonl /tmp/window.jsonl
+          PUB2IDML_CLI=1 ./pub2idml-x86_64.AppImage --version
+          PUB2IDML_CLI=1 ./pub2idml-x86_64.AppImage /tmp/sample.jsonl
+          test -s /tmp/sample.idml
+          echo "not a publisher file" > /tmp/bad.pub
+          ! PUB2IDML_CLI=1 ./pub2idml-x86_64.AppImage /tmp/bad.pub 2> /tmp/bad.log
+          cat /tmp/bad.log && grep -q "not a supported Publisher file" /tmp/bad.log
+          # window mode (no terminal -> AppRun starts the GUI) on a virtual display
+          xvfb-run -a env PUB2IDML_GUI_SELFTEST=1 ./pub2idml-x86_64.AppImage /tmp/window.jsonl < /dev/null
+          test -s /tmp/window.idml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub2idml-linux-x86_64
+          path: pub2idml-x86_64.AppImage
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" pub2idml-x86_64.AppImage --clobber
+
   windows:
     runs-on: windows-latest
     defaults:
@@ -59,14 +118,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build pub2idml.exe
+      - name: Build pub2idml.exe and pub2idml-app.exe
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip pyinstaller
+          python -m pip install --upgrade pip pyinstaller pillow
           python -m unittest discover -s tests -v
-          pyinstaller --onefile --console --name pub2idml pub2idml.py
+          python packaging/icon.py --ico pub2idml.ico
+          # command-line tool (console) and window app (no console) from the same source
+          pyinstaller --onefile --console --icon pub2idml.ico --name pub2idml pub2idml.py
+          pyinstaller --onefile --noconsole --icon pub2idml.ico --name pub2idml-app pub2idml.py
           Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md dist\
+          Copy-Item packaging\windows\*.cmd dist\
           .\dist\pub2idml.exe --version
+      - name: Test the window app and the Send-to script
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          python -c "import sys,json; sys.path.insert(0,'tests'); import test_pub2idml as t; open('sample.jsonl','w').write(''.join(json.dumps(e)+chr(10) for e in t.EVENTS))"
+          $env:PUB2IDML_GUI_SELFTEST = "1"
+          $p = Start-Process -Wait -PassThru -FilePath dist\pub2idml-app.exe -ArgumentList ('"' + (Resolve-Path sample.jsonl) + '"')
+          "app exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -or -not (Test-Path sample.idml)) { throw "window app did not convert" }
+          # a bad .pub must fail inside pub2json (proves pub2json and its DLLs load)
+          Set-Content bad.pub "not a publisher file"
+          $out = cmd /c "dist\pub2idml.exe bad.pub < NUL 2>&1" | Out-String
+          $out
+          if ($out -notmatch "not a supported Publisher file") { throw "pub2json did not run" }
+          cmd /c "dist\Senden-an-einrichten.cmd /quiet"
+          $lnk = Join-Path ([Environment]::GetFolderPath('SendTo')) 'pub2idml.lnk'
+          if (-not (Test-Path $lnk)) { throw "Send-to shortcut missing" }
+          (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+          cmd /c "dist\Senden-an-entfernen.cmd /quiet"
+          if (Test-Path $lnk) { throw "Send-to shortcut not removed" }
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
           New-Item -ItemType Directory -Force pub2idml-windows-x64 | Out-Null
           Copy-Item dist\* pub2idml-windows-x64\ -Recurse
           Compress-Archive -Path pub2idml-windows-x64 -DestinationPath pub2idml-windows-x64.zip
@@ -129,7 +215,7 @@ jobs:
       - name: Build pub2idml.app (drag and drop)
         run: |
           python -m pip install pillow
-          python mac/make_app.py --dist dist --out pub2idml.app --version "$(python pub2idml.py --version | cut -d' ' -f2)"
+          python packaging/mac/make_app.py --dist dist --out pub2idml.app --version "$(python pub2idml.py --version | cut -d' ' -f2)"
           plutil -p pub2idml.app/Contents/Info.plist | head -40
       - name: Test the app's conversion handler
         run: |

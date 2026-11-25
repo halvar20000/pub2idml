@@ -205,5 +205,31 @@ class ConvertTest(unittest.TestCase):
         self.assertAlmostEqual(math.dist(mid, (1, 0)), 1.0, places=3)
 
 
+class WindowModeHelpersTest(unittest.TestCase):
+    def test_expand_inputs_and_convert_many(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = os.path.join(tmp, "A label.jsonl")
+            with open(sample, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(e) + "\n" for e in EVENTS)
+            sub = os.path.join(tmp, "folder")
+            os.makedirs(sub)
+            open(os.path.join(sub, "broken.PUB"), "wb").write(b"not a publisher file")
+            open(os.path.join(sub, "notes.txt"), "w").write("x")
+            files, skipped = pub2idml.expand_inputs([sample, sub, os.path.join(tmp, "x.docx")])
+            self.assertEqual([os.path.basename(f) for f in files], ["A label.jsonl", "broken.PUB"])
+            self.assertEqual(skipped, 1)
+            seen = []
+            r = pub2idml.convert_many(files, lambda i, n, name: seen.append((i, n)))
+            self.assertEqual(seen, [(0, 2), (1, 2)])
+            self.assertEqual(r["converted"], 1)
+            self.assertEqual(len(r["failures"]), 1)
+            self.assertTrue(r["failures"][0].startswith("broken.PUB: "))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "A label.idml")))
+
+    def test_window_mode_selection(self):
+        self.assertTrue(pub2idml.wants_gui(["--gui", "x.pub"]))
+        self.assertFalse(pub2idml.wants_gui(["x.pub"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@
 
 macOS only (uses osacompile, codesign, iconutil). Usage:
 
-    python3 mac/make_app.py --dist DIR --out pub2idml.app --version 0.3.0
+    python3 packaging/mac/make_app.py --dist DIR --out pub2idml.app --version 0.3.0
 
 DIR must hold the CLI build: pub2idml, pub2json and libs/ (as produced in CI).
 
@@ -26,44 +26,16 @@ def run(*args):
 
 
 def make_icon(icns_path: str) -> bool:
-    """Draw a simple app icon (PUB -> IDML) and write it as .icns. Needs Pillow."""
+    """Write the shared app icon (packaging/icon.py) as .icns. Needs Pillow."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image
+
+        sys.path.insert(0, os.path.dirname(HERE))
+        import icon
     except ImportError:
         print("Pillow not installed - keeping the default droplet icon")
         return False
-
-    size = 1024
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    # rounded square, macOS-style margins
-    m = 100
-    d.rounded_rectangle((m, m, size - m, size - m), radius=180, fill=(255, 255, 255, 255))
-    d.rounded_rectangle((m, m, size - m, size // 2), radius=180, fill=(14, 116, 144, 255))  # teal top
-    d.rectangle((m, size // 2 - 180, size - m, size // 2), fill=(14, 116, 144, 255))
-    d.rounded_rectangle((m, m, size - m, size - m), radius=180, outline=(200, 200, 200, 255), width=6)
-
-    def font(px):
-        for f in (
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/Library/Fonts/Arial Bold.ttf",
-        ):
-            if os.path.exists(f):
-                return ImageFont.truetype(f, px)
-        return ImageFont.load_default(size=px)
-
-    def centered(text, y, px, fill):
-        f = font(px)
-        w = d.textlength(text, font=f)
-        d.text(((size - w) / 2, y), text, font=f, fill=fill)
-
-    centered(".pub", 200, 190, (255, 255, 255, 255))
-    # arrow
-    cx, top, bottom = size // 2, size // 2 + 30, size // 2 + 150
-    d.rectangle((cx - 22, top, cx + 22, bottom - 40), fill=(14, 116, 144, 255))
-    d.polygon([(cx - 80, bottom - 60), (cx + 80, bottom - 60), (cx, bottom + 20)], fill=(14, 116, 144, 255))
-    centered("IDML", size // 2 + 200, 190, (40, 40, 40, 255))
+    img = icon.draw(1024)
 
     with tempfile.TemporaryDirectory() as tmp:
         iconset = os.path.join(tmp, "icon.iconset")

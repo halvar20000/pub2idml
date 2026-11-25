@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=pub2idml
+GenericName=Publisher to IDML converter
+GenericName[de]=Publisher-zu-IDML-Konverter
+Comment=Convert Microsoft Publisher (.pub) files to IDML
+Comment[de]=Microsoft-Publisher-Dateien (.pub) in IDML umwandeln
+Exec=pub2idml %F
+Icon=pub2idml
+Terminal=false
+Categories=Office;Graphics;Publishing;
+MimeType=application/x-mspublisher;application/vnd.ms-publisher;
