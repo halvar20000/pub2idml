@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pub
+*.odg
+*.idml
+!tests/fixtures/*.odg
