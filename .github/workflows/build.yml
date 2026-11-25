@@ -1,0 +1,137 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # attach the zips to a release on version tags
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libmspub-dev librevenge-dev cmake pkg-config g++
+      - name: Build pub2json
+        run: cmake -S pub2json -B pub2json/build -DCMAKE_BUILD_TYPE=Release && cmake --build pub2json/build
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Smoke test
+        run: |
+          ./pub2json/build/pub2json --version
+          python3 pub2idml.py --version
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libmspub
+            zip
+      - name: Build pub2json
+        run: |
+          cmake -S pub2json -B pub2json/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build pub2json/build
+          strip pub2json/build/pub2json.exe
+      - name: Collect pub2json and its DLLs
+        run: |
+          mkdir -p dist
+          cp pub2json/build/pub2json.exe dist/
+          # every DLL that comes from MSYS2 (not from Windows itself) goes next to the exe
+          ldd pub2json/build/pub2json.exe | awk '/\/ucrt64\// {print $3}' | sort -u | xargs -I{} cp {} dist/
+          ls -l dist
+          ./dist/pub2json.exe --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build pub2idml.exe
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python -m unittest discover -s tests -v
+          pyinstaller --onefile --console --name pub2idml pub2idml.py
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md dist\
+          .\dist\pub2idml.exe --version
+          New-Item -ItemType Directory -Force pub2idml-windows-x64 | Out-Null
+          Copy-Item dist\* pub2idml-windows-x64\ -Recurse
+          Compress-Archive -Path pub2idml-windows-x64 -DestinationPath pub2idml-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub2idml-windows-x64
+          path: pub2idml-windows-x64.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:GITHUB_REF_NAME 2>$null; if ($LASTEXITCODE -ne 0) { gh release create $env:GITHUB_REF_NAME --generate-notes }
+          gh release upload $env:GITHUB_REF_NAME pub2idml-windows-x64.zip --clobber
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon
+            arch: arm64
+          - runner: macos-15-intel  # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install libmspub dylibbundler pkg-config cmake
+      - name: Build pub2json
+        run: |
+          cmake -S pub2json -B pub2json/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build pub2json/build
+      - name: Bundle pub2json with its libraries
+        run: |
+          mkdir -p dist/libs
+          cp pub2json/build/pub2json dist/
+          # copy the Homebrew dylibs next to the binary and point it at them
+          dylibbundler -od -b -x dist/pub2json -d dist/libs -p @executable_path/libs/
+          # dylibbundler rewrites load paths, so re-sign everything (ad hoc) for Apple Silicon
+          for f in dist/libs/*.dylib dist/pub2json; do codesign --force --sign - "$f"; done
+          otool -L dist/pub2json
+          ./dist/pub2json --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build pub2idml
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python -m unittest discover -s tests -v
+          pyinstaller --onefile --name pub2idml --distpath pyi pub2idml.py
+          cp pyi/pub2idml dist/
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/
+          ./dist/pub2idml --version
+          mv dist pub2idml-macos-${{ matrix.arch }}
+          # ditto keeps permissions and signatures inside the zip
+          ditto -c -k --keepParent pub2idml-macos-${{ matrix.arch }} pub2idml-macos-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub2idml-macos-${{ matrix.arch }}
+          path: pub2idml-macos-${{ matrix.arch }}.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" pub2idml-macos-${{ matrix.arch }}.zip --clobber

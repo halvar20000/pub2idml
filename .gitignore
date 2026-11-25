@@ -1,6 +1,13 @@
 __pycache__/
 *.pyc
+# customer documents and conversion output never go into the repository
 *.pub
 *.odg
 *.idml
-!tests/fixtures/*.odg
+*.jsonl
+# build output
+pub2json/build/
+build/
+dist/
+pyi/
+*.spec

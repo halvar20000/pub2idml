@@ -1,82 +1,78 @@
 #!/usr/bin/env python3
 """pub2idml - convert Microsoft Publisher (.pub) files to IDML.
 
-Pipeline:  .pub --(LibreOffice headless, libmspub import)--> .odg --(this script)--> .idml
+Pipeline:  .pub --(pub2json: libmspub)--> JSON Lines --(this script)--> .idml
 
-The .odg step only uses LibreOffice as an external program; this script itself
-reads the ODF drawing XML and writes an IDML package (InDesign Markup Language),
-which DesignCraft, InDesign, Affinity and others can open.
+pub2json is a small C++ helper (see pub2json/) built on libmspub, the
+Publisher reader also used by LibreOffice. It reports every page, shape, text
+run and image as one JSON object per line; this script turns that stream into
+an IDML package (InDesign Markup Language), which DesignCraft, InDesign,
+Affinity and others can open. LibreOffice itself is not needed.
 
 Usage:
-    pub2idml.py INPUT.pub|INPUT.odg [-o OUTPUT.idml] [--flatten-groups] [-v]
-    pub2idml.py --batch DIR [-o OUTDIR]
+    pub2idml INPUT.pub [-o OUTPUT.idml] [--flatten-groups] [-v]
+    pub2idml --batch DIR [-o OUTDIR]
+    pub2idml INPUT.jsonl            # a stream saved earlier with `pub2json IN.pub OUT.jsonl`
 
-Supported (prototype): pages and page size, text frames (font, size, bold,
-italic, underline, colour, alignment, rotation, insets), lines, polygons,
-polylines, rectangles, ellipses, SVG paths (incl. compound paths), groups,
-solid fills, strokes (weight, colour, dashes), bitmap fills / images.
-Not yet: tables, gradients, shadows, WordArt effects, linked text-frame chains.
+Supported: pages and page size, text frames (font, size, bold, italic,
+underline, colour, alignment, rotation, insets, vertical alignment), lines,
+polygons, polylines, rectangles, ellipses, Bezier paths with arcs, compound
+paths, groups, solid fills, strokes (weight, colour, dashes), bitmap fills /
+images. Not yet: tables, gradients, shadows, WordArt effects, linked text chains.
+
+SPDX-License-Identifier: MIT
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import math
 import os
-import re
 import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape, quoteattr
 
+__version__ = "0.2.0"
+
+PT_PER_UNIT = {"in": 72.0, "pt": 1.0, "twip": 1 / 20}
+
+
+def num(v, default: float = 0.0) -> float:
+    """A librevenge number {"v":..,"u":..} -> points (lengths) or plain value."""
+    if isinstance(v, dict):
+        return v["v"] * PT_PER_UNIT.get(v.get("u", ""), 1.0)
+    if isinstance(v, (int, float)):
+        return float(v)
+    return default
+
+
+def raw(v, default: float = 0.0) -> float:
+    """The bare number, ignoring the unit (librevenge tags angles and counts as inches)."""
+    if isinstance(v, dict):
+        return float(v["v"])
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def text(v, default: str = "") -> str:
+    if isinstance(v, dict):
+        return v.get("s", default)
+    return v if isinstance(v, str) else default
+
+
 # --------------------------------------------------------------------------- #
-# ODF namespaces
-NS = {
-    "office": "urn:oasis:names:tc:opendocument:xmlns:office:1.0",
-    "style": "urn:oasis:names:tc:opendocument:xmlns:style:1.0",
-    "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
-    "draw": "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0",
-    "fo": "urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0",
-    "svg": "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0",
-    "xlink": "http://www.w3.org/1999/xlink",
-    "loext": "urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0",
-}
-
-
-def q(tag: str) -> str:
-    """'draw:line' -> '{urn...}line'"""
-    p, local = tag.split(":")
-    return "{%s}%s" % (NS[p], local)
-
-
-def local(tag: str) -> str:
-    return tag.split("}", 1)[1] if "}" in tag else tag
-
-
-PT_PER = {"cm": 72 / 2.54, "mm": 72 / 25.4, "in": 72.0, "inch": 72.0, "pt": 1.0, "pc": 12.0, "px": 0.75}
-
-
-def length(v: str | None, default: float = 0.0) -> float:
-    """ODF length ('1.5cm', '10pt') -> points."""
-    if not v:
-        return default
-    m = re.match(r"\s*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)\s*([a-z%]*)", v)
-    if not m:
-        return default
-    num, unit = float(m.group(1)), m.group(2) or "cm"
-    if unit == "%":
-        return default
-    return num * PT_PER.get(unit, 72 / 2.54)
-
 
 def fmt(x: float) -> str:
     s = f"{x:.4f}".rstrip("0").rstrip(".")
     return "0" if s in ("-0", "") else s
+
 
 
 # --------------------------------------------------------------------------- #
@@ -104,41 +100,6 @@ def apply(m: Matrix, x: float, y: float) -> tuple[float, float]:
     return a * x + c * y + e, b * x + d * y + f
 
 
-def parse_odf_transform(s: str | None) -> Matrix:
-    """ODF draw:transform, e.g. 'rotate (1.57) translate (8cm 10cm)'.
-
-    Operations are applied left to right. ODF rotate() is counter-clockwise on
-    screen (y axis points down)."""
-    m = IDENT
-    if not s:
-        return m
-    for op, args in re.findall(r"([a-zA-Z]+)\s*\(([^)]*)\)", s):
-        vals = [a for a in re.split(r"[\s,]+", args.strip()) if a]
-        op = op.lower()
-        if op == "rotate":
-            a = float(vals[0])
-            c, sn = math.cos(a), math.sin(a)
-            t = (c, -sn, sn, c, 0.0, 0.0)
-        elif op == "translate":
-            tx = length(vals[0])
-            ty = length(vals[1]) if len(vals) > 1 else 0.0
-            t = (1.0, 0.0, 0.0, 1.0, tx, ty)
-        elif op == "scale":
-            sx = float(vals[0])
-            sy = float(vals[1]) if len(vals) > 1 else sx
-            t = (sx, 0.0, 0.0, sy, 0.0, 0.0)
-        elif op == "skewx":
-            t = (1.0, 0.0, math.tan(float(vals[0])), 1.0, 0.0, 0.0)
-        elif op == "skewy":
-            t = (1.0, math.tan(float(vals[0])), 0.0, 1.0, 0.0, 0.0)
-        elif op == "matrix":
-            n = [float(v) if re.match(r"^[-+0-9.eE]+$", v) else length(v) for v in vals]
-            t = tuple(n[:6])
-        else:
-            continue
-        m = mul(t, m)
-    return m
-
 
 # A path point in IDML terms: anchor + left (incoming) + right (outgoing) direction
 @dataclass
@@ -156,106 +117,6 @@ class SubPath:
     points: list[PPoint]
     closed: bool
 
-
-def parse_svg_path(d: str) -> list[SubPath]:
-    """Parse an SVG path into cubic-bezier subpaths (in path coordinates)."""
-    tokens = re.findall(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", d)
-    subs: list[SubPath] = []
-    pts: list[PPoint] = []
-    cx = cy = sx = sy = 0.0
-    last_c2 = None  # previous cubic control point (for S)
-    last_q = None  # previous quad control point (for T)
-    cmd = None
-    i = 0
-
-    def num():
-        nonlocal i
-        v = float(tokens[i])
-        i += 1
-        return v
-
-    def finish(closed: bool):
-        nonlocal pts
-        if len(pts) >= 2:
-            if closed:
-                f, l = pts[0], pts[-1]
-                if abs(f.x - l.x) < 1e-6 and abs(f.y - l.y) < 1e-6:
-                    f.lx, f.ly = l.lx, l.ly
-                    pts.pop()
-            subs.append(SubPath(pts, closed))
-        pts = []
-
-    def line_to(x, y):
-        nonlocal cx, cy
-        pts.append(PPoint(x, y, x, y, x, y))
-        cx, cy = x, y
-
-    def cubic(x1, y1, x2, y2, x, y):
-        nonlocal cx, cy
-        if pts:
-            pts[-1].rx, pts[-1].ry = x1, y1
-        pts.append(PPoint(x, y, x2, y2, x, y))
-        cx, cy = x, y
-
-    while i < len(tokens):
-        t = tokens[i]
-        if re.match(r"[A-Za-z]", t):
-            cmd = t
-            i += 1
-            if cmd in "Zz":
-                finish(True)
-                cx, cy = sx, sy
-                last_c2 = last_q = None
-                continue
-        elif cmd is None:
-            i += 1
-            continue
-        rel = cmd.islower()
-        C = cmd.upper()
-        ox, oy = (cx, cy) if rel else (0.0, 0.0)
-        if C == "M":
-            finish(False)
-            x, y = num() + ox, num() + oy
-            sx, sy = x, y
-            line_to(x, y)
-            cmd = "l" if rel else "L"  # subsequent pairs are lineto
-            last_c2 = last_q = None
-        elif C == "L":
-            line_to(num() + ox, num() + oy)
-            last_c2 = last_q = None
-        elif C == "H":
-            line_to(num() + ox, cy)
-            last_c2 = last_q = None
-        elif C == "V":
-            line_to(cx, num() + oy)
-            last_c2 = last_q = None
-        elif C == "C":
-            x1, y1, x2, y2, x, y = (num() + ox, num() + oy, num() + ox, num() + oy, num() + ox, num() + oy)
-            cubic(x1, y1, x2, y2, x, y)
-            last_c2, last_q = (x2, y2), None
-        elif C == "S":
-            x1, y1 = (2 * cx - last_c2[0], 2 * cy - last_c2[1]) if last_c2 else (cx, cy)
-            x2, y2, x, y = num() + ox, num() + oy, num() + ox, num() + oy
-            cubic(x1, y1, x2, y2, x, y)
-            last_c2, last_q = (x2, y2), None
-        elif C in "QT":
-            if C == "Q":
-                qx, qy = num() + ox, num() + oy
-            else:
-                qx, qy = (2 * cx - last_q[0], 2 * cy - last_q[1]) if last_q else (cx, cy)
-            x, y = num() + ox, num() + oy
-            cubic(cx + 2 / 3 * (qx - cx), cy + 2 / 3 * (qy - cy), x + 2 / 3 * (qx - x), y + 2 / 3 * (qy - y), x, y)
-            last_q, last_c2 = (qx, qy), None
-        elif C == "A":
-            rx, ry, rot, large, sweep = num(), num(), num(), num(), num()
-            x, y = num() + ox, num() + oy
-            for seg in arc_to_cubics(cx, cy, rx, ry, rot, int(large), int(sweep), x, y):
-                cubic(*seg)
-            last_c2 = last_q = None
-        else:
-            i += 1
-    finish(False)
-    return subs
 
 
 def arc_to_cubics(x1, y1, rx, ry, phi_deg, fa, fs, x2, y2):
@@ -348,62 +209,6 @@ def bbox(subs: list[SubPath]):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-# --------------------------------------------------------------------------- #
-# ODF style resolution
-
-
-class Styles:
-    """Resolves ODF styles with inheritance (automatic -> named -> default)."""
-
-    def __init__(self, content: ET.Element, styles: ET.Element | None):
-        self.by_name: dict[tuple[str, str], ET.Element] = {}
-        self.defaults: dict[str, ET.Element] = {}
-        self.fill_images: dict[str, str] = {}
-        self.dashes: dict[str, ET.Element] = {}
-        roots = [r for r in (styles, content) if r is not None]
-        for root in roots:
-            for st in root.iter(q("style:style")):
-                self.by_name[(st.get(q("style:family")), st.get(q("style:name")))] = st
-            for st in root.iter(q("style:default-style")):
-                self.defaults[st.get(q("style:family"))] = st
-            for fi in root.iter(q("draw:fill-image")):
-                self.fill_images[fi.get(q("draw:name"))] = fi.get(q("xlink:href"))
-            for ds in root.iter(q("draw:stroke-dash")):
-                self.dashes[ds.get(q("draw:name"))] = ds
-        self.page_layouts = {}
-        self.master_pages = {}
-        if styles is not None:
-            for pl in styles.iter(q("style:page-layout")):
-                props = pl.find(q("style:page-layout-properties"))
-                if props is not None:
-                    self.page_layouts[pl.get(q("style:name"))] = props
-            for mp in styles.iter(q("style:master-page")):
-                self.master_pages[mp.get(q("style:name"))] = mp.get(q("style:page-layout-name"))
-
-    def chain(self, family: str, name: str | None) -> list[ET.Element]:
-        out, seen = [], set()
-        while name and (family, name) in self.by_name and name not in seen:
-            seen.add(name)
-            st = self.by_name[(family, name)]
-            out.append(st)
-            name = st.get(q("style:parent-style-name"))
-        if family in self.defaults:
-            out.append(self.defaults[family])
-        return out
-
-    def props(self, family: str, name: str | None, kind: str) -> dict[str, str]:
-        """Merged properties of child element `kind` (e.g. 'style:graphic-properties')."""
-        merged: dict[str, str] = {}
-        for st in reversed(self.chain(family, name)):
-            for el in st.findall(q(kind)):
-                for k, v in el.attrib.items():
-                    merged[k] = v
-        return merged
-
-
-def prop(d: dict, key: str, default=None):
-    return d.get(q(key), default)
-
 
 # --------------------------------------------------------------------------- #
 # Intermediate model
@@ -452,330 +257,330 @@ class Para:
     align: str = "LeftAlign"
 
 
+
 # --------------------------------------------------------------------------- #
-# ODG reader
+# Reader for the pub2json event stream (librevenge drawing interface)
 
 
-class OdgReader:
-    def __init__(self, odg_path: str, verbose: bool = False, flatten_groups: bool = False):
-        self.zip = zipfile.ZipFile(odg_path)
-        self.content = ET.fromstring(self.zip.read("content.xml"))
-        try:
-            self.styles_root = ET.fromstring(self.zip.read("styles.xml"))
-        except KeyError:
-            self.styles_root = None
-        self.st = Styles(self.content, self.styles_root)
-        self.verbose = verbose
+def path_from_actions(actions: list) -> list[SubPath]:
+    """librevenge svg:d (absolute, inches) -> cubic subpaths in points."""
+    subs: list[SubPath] = []
+    pts: list[PPoint] = []
+    cx = cy = sx = sy = 0.0
+
+    def finish(closed: bool):
+        nonlocal pts
+        if len(pts) >= 2:
+            if closed:
+                f, l = pts[0], pts[-1]
+                if abs(f.x - l.x) < 1e-4 and abs(f.y - l.y) < 1e-4:
+                    f.lx, f.ly = l.lx, l.ly
+                    pts.pop()
+            if len(pts) >= 2:
+                subs.append(SubPath(pts, closed))
+        pts = []
+
+    for a in actions:
+        act = a.get("librevenge:path-action", "")
+        x, y = num(a.get("svg:x"), cx), num(a.get("svg:y"), cy)
+        if act == "M":
+            finish(False)
+            pts.append(PPoint(x, y, x, y, x, y))
+            sx, sy = x, y
+        elif act == "L":
+            pts.append(PPoint(x, y, x, y, x, y))
+        elif act == "H":
+            y = cy
+            pts.append(PPoint(x, y, x, y, x, y))
+        elif act == "V":
+            x = cx
+            pts.append(PPoint(x, y, x, y, x, y))
+        elif act in ("C", "S", "Q", "T"):
+            if act == "C":
+                x1, y1 = num(a.get("svg:x1")), num(a.get("svg:y1"))
+                x2, y2 = num(a.get("svg:x2")), num(a.get("svg:y2"))
+            elif act == "S":
+                prev = pts[-1] if pts else None
+                x1, y1 = (2 * cx - prev.lx, 2 * cy - prev.ly) if prev else (cx, cy)
+                x2, y2 = num(a.get("svg:x2")), num(a.get("svg:y2"))
+            else:
+                qx, qy = (num(a.get("svg:x1")), num(a.get("svg:y1"))) if act == "Q" else (cx, cy)
+                x1, y1 = cx + 2 / 3 * (qx - cx), cy + 2 / 3 * (qy - cy)
+                x2, y2 = x + 2 / 3 * (qx - x), y + 2 / 3 * (qy - y)
+            if not pts:
+                pts.append(PPoint(cx, cy, cx, cy, cx, cy))
+            pts[-1].rx, pts[-1].ry = x1, y1
+            pts.append(PPoint(x, y, x2, y2, x, y))
+        elif act == "A":
+            if not pts:
+                pts.append(PPoint(cx, cy, cx, cy, cx, cy))
+            segs = arc_to_cubics(
+                cx, cy,
+                num(a.get("svg:rx")), num(a.get("svg:ry")),
+                raw(a.get("librevenge:rotate")),
+                int(raw(a.get("librevenge:large-arc"))), int(raw(a.get("librevenge:sweep"))),
+                x, y,
+            )
+            for x1, y1, x2, y2, ex, ey in segs:
+                pts[-1].rx, pts[-1].ry = x1, y1
+                pts.append(PPoint(ex, ey, x2, y2, ex, ey))
+        elif act == "Z":
+            finish(True)
+            x, y = sx, sy
+        cx, cy = x, y
+    finish(False)
+    return subs
+
+
+class PubReader:
+    """Builds pages and shapes from the pub2json event stream."""
+
+    def __init__(self, events, flatten_groups: bool = False):
+        self.events = events
         self.flatten = flatten_groups
         self.warnings: list[str] = []
         self.skipped: dict[str, int] = {}
+        self.style: dict = {}
 
     def warn(self, msg: str):
         if msg not in self.warnings:
             self.warnings.append(msg)
 
-    # ---- pages ----
-    def pages(self) -> list[Page]:
-        out = []
-        drawing = self.content.find(".//" + q("office:drawing"))
-        if drawing is None:
-            raise SystemExit("no office:drawing in content.xml (is this an ODG file?)")
-        for pg in drawing.findall(q("draw:page")):
-            w, h = 595.28, 841.89
-            layout = self.st.master_pages.get(pg.get(q("draw:master-page-name")))
-            props = self.st.page_layouts.get(layout)
-            if props is not None:
-                w = length(props.get(q("fo:page-width")), w)
-                h = length(props.get(q("fo:page-height")), h)
-            shapes = self.children(pg, IDENT)
-            out.append(Page(w, h, shapes, pg.get(q("draw:name"), "")))
-        return out
-
-    def children(self, parent: ET.Element, m: Matrix) -> list[Shape]:
-        out = []
-        for el in parent:
-            res = self.shape(el, m)
-            if res is None:
-                continue
-            if isinstance(res, list):
-                out.extend(res)
-            else:
-                out.append(res)
-        return out
-
-    # ---- style helpers ----
-    def gprops(self, el: ET.Element) -> dict:
-        g = self.st.props("graphic", el.get(q("draw:style-name")), "style:graphic-properties")
-        # libmspub sometimes also puts fill info on the paragraph style (loext:graphic-properties)
-        tsn = el.get(q("draw:text-style-name"))
-        if tsn and q("draw:fill") not in self.st.props("graphic", el.get(q("draw:style-name")), "style:graphic-properties"):
-            p = self.st.props("paragraph", tsn, "loext:graphic-properties")
-            for k, v in p.items():
-                g.setdefault(k, v)
-        return g
-
-    def apply_paint(self, s: Shape, g: dict, allow_fill: bool = True):
-        stroke = prop(g, "draw:stroke", "solid")
+    # ---- paint ----
+    def paint(self, s: Shape, allow_fill: bool = True):
+        st = self.style
+        stroke = st.get("draw:stroke", "none")
         if stroke != "none":
-            s.stroke = prop(g, "svg:stroke-color", "#000000")
-            w = length(prop(g, "svg:stroke-width"), 0.0)
-            s.stroke_weight = w if w > 0 else 0.25  # ODF width 0 = hairline
+            s.stroke = st.get("svg:stroke-color", "#000000")
+            w = num(st.get("svg:stroke-width"), 0.0)
+            s.stroke_weight = w if w > 0 else 0.25  # 0 = hairline
             if stroke == "dash":
-                ds = self.st.dashes.get(prop(g, "draw:stroke-dash"))
-                if ds is not None:
-                    dl = length(ds.get(q("draw:dots1-length")), s.stroke_weight * 3) or s.stroke_weight
-                    gap = length(ds.get(q("draw:distance")), s.stroke_weight * 2) or s.stroke_weight
-                    s.dash = (max(dl, 0.1), max(gap, 0.1))
-                else:
-                    s.dash = (3.0, 2.0)
+                dl = num(st.get("draw:dots1-length"), 0.0)
+                if isinstance(st.get("draw:dots1-length"), dict) and st["draw:dots1-length"].get("u") == "%":
+                    dl = raw(st["draw:dots1-length"]) / 100 * s.stroke_weight
+                gap = num(st.get("draw:distance"), 0.0)
+                if isinstance(st.get("draw:distance"), dict) and st["draw:distance"].get("u") == "%":
+                    gap = raw(st["draw:distance"]) / 100 * s.stroke_weight
+                s.dash = (max(dl or s.stroke_weight * 3, 0.1), max(gap or s.stroke_weight * 2, 0.1))
         if not allow_fill:
             return
-        fill = prop(g, "draw:fill", "none")
+        fill = st.get("draw:fill", "none")
         if fill == "solid":
-            s.fill = prop(g, "draw:fill-color", "#729fcf")
-            op = prop(g, "draw:opacity")
-            if op and op.endswith("%"):
-                s.fill_opacity = float(op[:-1]) / 100
+            s.fill = st.get("draw:fill-color", "#000000")
+            op = st.get("draw:opacity")
+            if isinstance(op, dict) and op.get("u") == "%":
+                s.fill_opacity = raw(op) / 100
         elif fill == "gradient":
-            s.fill = prop(g, "draw:fill-color", "#cccccc")
+            grad = st.get("svg:linearGradient") or st.get("svg:radialGradient")
+            colour = st.get("draw:start-color") or st.get("draw:fill-color")
+            if not colour and isinstance(grad, list) and grad:
+                colour = grad[0].get("svg:stop-color")
+            s.fill = colour or "#cccccc"
             self.warn("gradient fills are approximated by a solid colour")
-        elif fill == "hatch":
-            self.warn("hatch fills are not supported")
         elif fill == "bitmap":
-            href = self.st.fill_images.get(prop(g, "draw:fill-image-name"))
-            if href:
-                img = self.load_image(href)
-                if img:
-                    s.image = img
-            if prop(g, "style:repeat", "repeat") not in ("stretch", "no-repeat"):
+            data = st.get("draw:fill-image")
+            if isinstance(data, str) and data:
+                try:
+                    blob = base64.b64decode(data)
+                except ValueError:
+                    blob = b""
+                size = image_size(blob)
+                if size:
+                    mime, w, h = size
+                    s.image = (blob, mime, w, h)
+                else:
+                    self.warn(f"image of type {st.get('librevenge:mime-type', '?')} is not supported and was skipped")
+            if st.get("style:repeat", "stretch") not in ("stretch", "no-repeat"):
                 self.warn("tiled bitmap fills are placed once, stretched to the frame")
+        elif fill not in ("none", ""):
+            self.warn(f"fill type '{fill}' is not supported")
 
-    def load_image(self, href: str):
-        try:
-            data = self.zip.read(href)
-        except KeyError:
-            self.warn(f"image {href} not found in package")
-            return None
-        size = image_size(data)
-        if not size:
-            self.warn(f"image {href}: unknown format, skipped")
-            return None
-        mime, w, h = size
-        return (data, mime, w, h)
+    # ---- events ----
+    def pages(self) -> list[Page]:
+        pages: list[Page] = []
+        stack: list[list[Shape]] = []  # current container (page / group)
+        text_obj: Shape | None = None
+        para: Para | None = None
+        span_props: list[dict] = [{}]
+        page_w = page_h = 0.0
 
-    # ---- geometry of a shape element ----
-    def base_matrix(self, el: ET.Element, m: Matrix) -> Matrix:
-        tr = el.get(q("draw:transform"))
-        x = length(el.get(q("svg:x")))
-        y = length(el.get(q("svg:y")))
-        local_m = parse_odf_transform(tr) if tr else (1.0, 0.0, 0.0, 1.0, x, y)
-        return mul(m, local_m)
+        def add(s: Shape):
+            if stack:
+                stack[-1].append(s)
 
-    def viewbox_matrix(self, el: ET.Element) -> Matrix:
-        w = length(el.get(q("svg:width")))
-        h = length(el.get(q("svg:height")))
-        vb = el.get(q("svg:viewBox"))
-        if not vb:
-            return IDENT
-        vx, vy, vw, vh = [float(v) for v in vb.split()]
-        sx = w / vw if vw else 1.0
-        sy = h / vh if vh else 1.0
-        return (sx, 0.0, 0.0, sy, -vx * sx, -vy * sy)
+        for e in self.events:
+            op, p = e["op"], e.get("p", {})
+            if op == "startPage":
+                page_w = num(p.get("svg:width"), 595.28)
+                page_h = num(p.get("svg:height"), 841.89)
+                stack = [[]]
+            elif op == "endPage":
+                pages.append(Page(page_w, page_h, stack[0] if stack else []))
+                stack = []
+            elif op in ("startLayer", "openGroup"):
+                stack.append([])
+            elif op in ("endLayer", "closeGroup"):
+                if len(stack) > 1:
+                    kids = stack.pop()
+                    if not kids:
+                        continue
+                    if self.flatten or len(kids) == 1:
+                        stack[-1].extend(kids)
+                    else:
+                        stack[-1].append(Shape("Group", children=kids))
+            elif op == "setStyle":
+                self.style = p
+            elif op in ("drawPath", "drawPolygon", "drawPolyline"):
+                if op == "drawPath":
+                    subs = path_from_actions(p.get("svg:d", []))
+                else:
+                    raw_pts = [(num(q.get("svg:x")), num(q.get("svg:y"))) for q in p.get("svg:points", [])]
+                    closed = op == "drawPolygon"
+                    if closed and len(raw_pts) > 2 and math.dist(raw_pts[0], raw_pts[-1]) < 1e-4:
+                        raw_pts.pop()
+                    subs = [SubPath([PPoint(x, y, x, y, x, y) for x, y in raw_pts], closed)] if len(raw_pts) >= 2 else []
+                if not subs:
+                    continue
+                closed = any(sp.closed for sp in subs)
+                kind = "Polygon"
+                if not closed and len(subs) == 1 and len(subs[0].points) == 2 and all(
+                    (pt.x, pt.y) == (pt.lx, pt.ly) == (pt.rx, pt.ry) for pt in subs[0].points
+                ):
+                    kind = "GraphicLine"
+                s = Shape(kind, subs)
+                self.paint(s, allow_fill=closed)
+                add(s)
+            elif op in ("drawRectangle", "drawEllipse"):
+                if op == "drawRectangle":
+                    x, y = num(p.get("svg:x")), num(p.get("svg:y"))
+                    w, h = num(p.get("svg:width")), num(p.get("svg:height"))
+                    s = Shape("Rectangle", rect_path(x, y, w, h))
+                else:
+                    cx, cy = num(p.get("svg:cx")), num(p.get("svg:cy"))
+                    rx, ry = num(p.get("svg:rx")), num(p.get("svg:ry"))
+                    s = Shape("Oval", ellipse_path(cx - rx, cy - ry, 2 * rx, 2 * ry))
+                    rot = raw(p.get("librevenge:rotate"))
+                    if rot:
+                        m = rotation_about(-math.radians(rot), cx, cy)
+                        s.paths = transform_subpaths(s.paths, m)
+                self.paint(s)
+                add(s)
+            elif op == "drawGraphicObject":
+                x, y = num(p.get("svg:x")), num(p.get("svg:y"))
+                w, h = num(p.get("svg:width")), num(p.get("svg:height"))
+                s = Shape("Rectangle", rect_path(x, y, w, h))
+                data = p.get("office:binary-data")
+                blob = base64.b64decode(data) if isinstance(data, str) else b""
+                size = image_size(blob)
+                if size:
+                    s.image = (blob, size[0], size[1], size[2])
+                    add(s)
+                else:
+                    self.warn(f"embedded graphic of type {p.get('librevenge:mime-type', '?')} is not supported")
+            elif op == "drawConnector":
+                pts = [(num(q.get("svg:x")), num(q.get("svg:y"))) for q in p.get("svg:points", [])]
+                if len(pts) >= 2:
+                    s = Shape("GraphicLine", [SubPath([PPoint(x, y, x, y, x, y) for x, y in pts], False)])
+                    self.paint(s, allow_fill=False)
+                    add(s)
+            elif op == "startTextObject":
+                x, y = num(p.get("svg:x")), num(p.get("svg:y"))
+                w, h = num(p.get("svg:width")), num(p.get("svg:height"))
+                rot = raw(p.get("librevenge:rotate"))
+                # librevenge: the box rotates about its centre; positive = counter-clockwise
+                m = (1.0, 0.0, 0.0, 1.0, x, y)
+                if rot:
+                    m = mul(rotation_about(-math.radians(rot), x + w / 2, y + h / 2), m)
+                text_obj = Shape("TextFrame", rect_path(0, 0, w, h), item_transform=m, story=[])
+                # a text box is painted only by its own properties, not by the last setStyle
+                saved, self.style = self.style, {"draw:fill": "none", "draw:stroke": "none", **p}
+                self.paint(text_obj)
+                self.style = saved
+                text_obj.insets = (
+                    num(p.get("fo:padding-top")),
+                    num(p.get("fo:padding-left")),
+                    num(p.get("fo:padding-bottom")),
+                    num(p.get("fo:padding-right")),
+                )
+                va = text(p.get("draw:textarea-vertical-align"), "top")
+                text_obj.valign = {"middle": "CenterAlign", "bottom": "BottomAlign", "justify": "JustifyAlign"}.get(
+                    va, "TopAlign"
+                )
+            elif op == "endTextObject":
+                if text_obj is not None:
+                    paras = text_obj.story or []
+                    for pa in paras:  # libmspub ends every paragraph with \r
+                        while pa.runs and not pa.runs[-1].text.rstrip("\r\n"):
+                            pa.runs.pop()
+                        if pa.runs:
+                            pa.runs[-1].text = pa.runs[-1].text.rstrip("\r\n")
+                    while paras and not paras[-1].runs:
+                        paras.pop()
+                    has_text = any(r.text.strip() for pa in paras for r in pa.runs)
+                    if has_text or text_obj.fill or text_obj.stroke:
+                        add(text_obj)
+                text_obj = None
+            elif op == "openParagraph":
+                align = {"center": "CenterAlign", "right": "RightAlign", "end": "RightAlign", "justify": "LeftJustified"}.get(
+                    text(p.get("fo:text-align"), "left"), "LeftAlign"
+                )
+                para = Para([], align)
+                span_props = [p]
+            elif op == "closeParagraph":
+                if text_obj is not None and para is not None:
+                    text_obj.story.append(para)
+                para = None
+            elif op == "openSpan":
+                merged = dict(span_props[0])
+                merged.update(p)
+                span_props.append(merged)
+            elif op == "closeSpan":
+                if len(span_props) > 1:
+                    span_props.pop()
+            elif op in ("insertText", "insertSpace", "insertTab", "insertLineBreak"):
+                if para is None:
+                    continue
+                t = {"insertSpace": " ", "insertTab": "\t", "insertLineBreak": " "}.get(op, e.get("t", ""))
+                para.runs.append(self.make_run(t, span_props[-1]))
+            elif op == "startTableObject":
+                self.warn("tables are not supported yet and were skipped")
+                self.skipped["table"] = self.skipped.get("table", 0) + 1
+            elif op in ("startDocument", "endDocument", "setDocumentMetaData", "closeLink", "openLink",
+                        "openUnorderedListLevel", "openOrderedListLevel", "closeUnorderedListLevel",
+                        "closeOrderedListLevel", "openListElement", "closeListElement", "defineParagraphStyle",
+                        "defineCharacterStyle", "defineEmbeddedFont", "startMasterPage", "endMasterPage",
+                        "startEmbeddedGraphics", "endEmbeddedGraphics", "openTableRow", "closeTableRow",
+                        "openTableCell", "closeTableCell", "insertCoveredTableCell", "endTableObject", "insertField"):
+                pass
+            else:
+                self.skipped[op] = self.skipped.get(op, 0) + 1
+        return pages
 
-    # ---- shapes ----
-    def shape(self, el: ET.Element, m: Matrix):
-        tag = local(el.tag)
-        ns = el.tag.split("}")[0][1:] if "}" in el.tag else ""
-        if ns != NS["draw"]:
-            return None
-        if tag == "g":
-            kids = self.children(el, m)
-            if not kids:
-                return None
-            if self.flatten or len(kids) == 1:
-                return kids
-            return Shape("Group", children=kids)
-        if tag == "line":
-            p1 = apply(m, length(el.get(q("svg:x1"))), length(el.get(q("svg:y1"))))
-            p2 = apply(m, length(el.get(q("svg:x2"))), length(el.get(q("svg:y2"))))
-            s = Shape("GraphicLine", [SubPath([PPoint(*p1, *p1, *p1), PPoint(*p2, *p2, *p2)], False)])
-            self.apply_paint(s, self.gprops(el), allow_fill=False)
-            return self.with_text(s, el, m)
-        if tag in ("polygon", "polyline"):
-            pts = []
-            for pair in (el.get(q("draw:points")) or "").split():
-                a, b = pair.split(",")
-                pts.append((float(a), float(b)))
-            if len(pts) < 2:
-                return None
-            mm = mul(self.base_matrix(el, m), self.viewbox_matrix(el))
-            closed = tag == "polygon"
-            sub = SubPath([PPoint(*apply(mm, *p), *apply(mm, *p), *apply(mm, *p)) for p in pts], closed)
-            kind = "Polygon" if closed or len(pts) > 2 else "GraphicLine"
-            s = Shape(kind, [sub])
-            self.apply_paint(s, self.gprops(el), allow_fill=closed)
-            return self.with_text(s, el, m)
-        if tag == "path":
-            subs = parse_svg_path(el.get(q("svg:d")) or "")
-            subs = [sp for sp in subs if len(sp.points) >= 2 or (sp.closed and len(sp.points) >= 1)]
-            subs = [sp for sp in subs if len(sp.points) >= 2]
-            if not subs:
-                return None
-            mm = mul(self.base_matrix(el, m), self.viewbox_matrix(el))
-            subs = transform_subpaths(subs, mm)
-            closed = any(sp.closed for sp in subs)
-            kind = "Polygon"
-            if not closed and len(subs) == 1 and len(subs[0].points) == 2:
-                kind = "GraphicLine"
-            s = Shape(kind, subs)
-            self.apply_paint(s, self.gprops(el), allow_fill=closed)
-            return self.with_text(s, el, m)
-        if tag in ("rect", "ellipse", "circle"):
-            w = length(el.get(q("svg:width")))
-            h = length(el.get(q("svg:height")))
-            bm = self.base_matrix(el, m)
-            subs = rect_path(0, 0, w, h) if tag == "rect" else ellipse_path(0, 0, w, h)
-            s = Shape("Rectangle" if tag == "rect" else "Oval", transform_subpaths(subs, bm))
-            self.apply_paint(s, self.gprops(el))
-            return self.with_text(s, el, m)
-        if tag == "frame":
-            return self.frame(el, m)
-        if tag == "custom-shape":
-            # fall back to the bounding box; enhanced geometry is not evaluated
-            w = length(el.get(q("svg:width")))
-            h = length(el.get(q("svg:height")))
-            bm = self.base_matrix(el, m)
-            s = Shape("Rectangle", transform_subpaths(rect_path(0, 0, w, h), bm))
-            self.apply_paint(s, self.gprops(el))
-            self.warn("custom shapes (AutoShapes) are converted to their bounding rectangle")
-            return self.with_text(s, el, m)
-        if tag in ("connector", "measure"):
-            p1 = apply(m, length(el.get(q("svg:x1"))), length(el.get(q("svg:y1"))))
-            p2 = apply(m, length(el.get(q("svg:x2"))), length(el.get(q("svg:y2"))))
-            s = Shape("GraphicLine", [SubPath([PPoint(*p1, *p1, *p1), PPoint(*p2, *p2, *p2)], False)])
-            self.apply_paint(s, self.gprops(el), allow_fill=False)
-            return s
-        self.skipped[tag] = self.skipped.get(tag, 0) + 1
-        return None
-
-    def with_text(self, s: Shape, el: ET.Element, m: Matrix):
-        """Shapes can carry text (text:p children). Add a text frame on top if non-empty."""
-        paras = self.paragraphs(el)
-        if not paras:
-            return s
-        x0, y0, x1, y1 = bbox(s.paths)
-        tf = Shape("TextFrame", rect_path(x0, y0, x1 - x0, y1 - y0), story=paras, valign="CenterAlign")
-        return [s, tf]
-
-    def frame(self, el: ET.Element, m: Matrix):
-        w = length(el.get(q("svg:width")))
-        h = length(el.get(q("svg:height")))
-        bm = self.base_matrix(el, m)
-        g = self.gprops(el)
-        tb = el.find(q("draw:text-box"))
-        img = el.find(q("draw:image"))
-        if img is not None and tb is None:
-            href = img.get(q("xlink:href"))
-            data = self.load_image(href) if href else None
-            s = Shape("Rectangle", transform_subpaths(rect_path(0, 0, w, h), bm))
-            self.apply_paint(s, g)
-            s.fill = None if s.fill == "#729fcf" else s.fill
-            if data:
-                s.image = data
-            return s
-        if tb is None:
-            self.skipped["frame(" + ",".join(local(c.tag) for c in el) + ")"] = 1
-            return None
-        paras = self.paragraphs(tb)
-        s = Shape("TextFrame", rect_path(0, 0, w, h), item_transform=bm, story=paras)
-        self.apply_paint(s, g)
-        s.insets = (
-            length(prop(g, "fo:padding-top")),
-            length(prop(g, "fo:padding-left")),
-            length(prop(g, "fo:padding-bottom")),
-            length(prop(g, "fo:padding-right")),
-        )
-        va = prop(g, "draw:textarea-vertical-align", "top")
-        s.valign = {"middle": "CenterAlign", "bottom": "BottomAlign", "justify": "JustifyAlign"}.get(va, "TopAlign")
-        has_text = any(r.text.strip() for p in paras for r in p.runs)
-        if not has_text and not s.fill and not s.stroke:
-            return None  # empty placeholder text box (libmspub emits these in groups)
-        return s
-
-    # ---- text ----
-    def text_props(self, family: str, name: str | None) -> dict:
-        return self.st.props(family, name, "style:text-properties")
-
-    def paragraphs(self, container: ET.Element) -> list[Para]:
-        out = []
-        for p in container:
-            if local(p.tag) == "p" or local(p.tag) == "h":
-                out.append(self.paragraph(p))
-            elif local(p.tag) == "list":
-                for item in p.iter(q("text:p")):
-                    out.append(self.paragraph(item))
-        # drop trailing empty paragraphs
-        while out and not any(r.text for r in out[-1].runs):
-            out.pop()
-        return out
-
-    def paragraph(self, p: ET.Element) -> Para:
-        pname = p.get(q("text:style-name"))
-        pprops = self.st.props("paragraph", pname, "style:paragraph-properties")
-        align = {
-            "center": "CenterAlign",
-            "end": "RightAlign",
-            "right": "RightAlign",
-            "justify": "LeftJustified",
-        }.get(prop(pprops, "fo:text-align", "start"), "LeftAlign")
-        base = self.text_props("paragraph", pname)
-        runs: list[Run] = []
-        self.collect(p, base, runs)
-        # strip the trailing space libmspub appends to every paragraph
-        if runs and runs[-1].text.endswith(" "):
-            runs[-1].text = runs[-1].text.rstrip(" ")
-        return Para([r for r in runs if r.text], align)
-
-    def make_run(self, text: str, tp: dict) -> Run:
-        weight = prop(tp, "fo:font-weight", "normal")
-        italic = prop(tp, "fo:font-style", "normal") in ("italic", "oblique")
+    @staticmethod
+    def make_run(t: str, sp: dict) -> Run:
+        weight = text(sp.get("fo:font-weight"), "normal")
         bold = weight in ("bold", "600", "700", "800", "900")
+        italic = text(sp.get("fo:font-style"), "normal") in ("italic", "oblique")
         style = "Bold Italic" if bold and italic else "Bold" if bold else "Italic" if italic else "Regular"
-        font = prop(tp, "style:font-name") or prop(tp, "fo:font-family") or "Calibri"
-        font = font.strip("'\"")
-        size_v = prop(tp, "fo:font-size", "12pt")
-        size = length(size_v, 12.0) if not size_v.endswith("%") else 12.0
+        size = num(sp.get("fo:font-size"), 12.0) if not (isinstance(sp.get("fo:font-size"), dict) and sp["fo:font-size"].get("u") == "%") else 12.0
         return Run(
-            text,
-            font=font,
+            t,
+            font=text(sp.get("style:font-name"), "Calibri") or "Calibri",
             style=style,
             size=size,
-            color=prop(tp, "fo:color", "#000000"),
-            underline=prop(tp, "style:text-underline-style", "none") != "none",
-            strike=prop(tp, "style:text-line-through-style", "none") != "none",
+            color=text(sp.get("fo:color"), "#000000"),
+            underline=text(sp.get("style:text-underline-type"), "none") not in ("none", "")
+            or text(sp.get("style:text-underline-style"), "none") not in ("none", ""),
+            strike=text(sp.get("style:text-line-through-type"), "none") not in ("none", "")
+            or text(sp.get("style:text-line-through-style"), "none") not in ("none", ""),
         )
 
-    def collect(self, el: ET.Element, tp: dict, runs: list[Run]):
-        if el.text:
-            runs.append(self.make_run(el.text, tp))
-        for c in el:
-            t = local(c.tag)
-            if t == "span":
-                ctp = dict(tp)
-                ctp.update(self.text_props("text", c.get(q("text:style-name"))))
-                self.collect(c, ctp, runs)
-            elif t == "s":
-                runs.append(self.make_run(" " * int(c.get(q("text:c"), "1")), tp))
-            elif t == "tab":
-                runs.append(self.make_run("\t", tp))
-            elif t == "line-break":
-                runs.append(self.make_run("\u2028", tp))
-            elif t in ("a", "span"):
-                self.collect(c, tp, runs)
-            else:
-                self.collect(c, tp, runs)
-            if c.tail:
-                runs.append(self.make_run(c.tail, tp))
+
+def rotation_about(a: float, cx: float, cy: float) -> Matrix:
+    """Rotate by a radians (counter-clockwise on screen, y down) about (cx, cy)."""
+    c, s = math.cos(a), math.sin(a)
+    return mul((1.0, 0.0, 0.0, 1.0, cx, cy), mul((c, -s, s, c, 0.0, 0.0), (1.0, 0.0, 0.0, 1.0, -cx, -cy)))
+
 
 
 def image_size(data: bytes):
@@ -802,6 +607,7 @@ def image_size(data: bytes):
         w, h = struct.unpack("<ii", data[18:26])
         return "image/bmp", w, abs(h)
     return None
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1133,58 +939,63 @@ class IdmlWriter:
                 z.writestr(f"Stories/Story_{s}.xml", xml, compress_type=zc)
 
 
+
 # --------------------------------------------------------------------------- #
 # Driver
 
-
-def find_soffice() -> str:
-    for name in ("soffice", "libreoffice"):
-        p = shutil.which(name)
-        if p:
-            return p
-    for p in (
-        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-        r"C:\Program Files\LibreOffice\program\soffice.exe",
-        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-    ):
-        if os.path.exists(p):
-            return p
-    raise SystemExit("LibreOffice (soffice) not found - install it from https://www.libreoffice.org/")
+EXE = ".exe" if os.name == "nt" else ""
 
 
-def pub_to_odg(pub: str, workdir: str) -> str:
-    soffice = find_soffice()
-    profile = os.path.join(workdir, "lo-profile")
-    cmd = [
-        soffice,
-        f"-env:UserInstallation=file://{os.path.abspath(profile)}",
-        "--headless",
-        "--convert-to",
-        "odg",
-        "--outdir",
-        workdir,
-        pub,
+def find_pub2json() -> str:
+    """pub2json next to this program (or inside a PyInstaller bundle), then on PATH."""
+    here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    candidates = [
+        os.environ.get("PUB2JSON", ""),
+        os.path.join(getattr(sys, "_MEIPASS", here), "pub2json" + EXE),
+        os.path.join(here, "pub2json" + EXE),
+        os.path.join(here, "pub2json", "build", "pub2json" + EXE),
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-    odg = os.path.join(workdir, os.path.splitext(os.path.basename(pub))[0] + ".odg")
-    if not os.path.exists(odg):
-        raise SystemExit(f"LibreOffice could not convert {pub}")
-    return odg
+    for c in candidates:
+        if c and os.path.isfile(c):
+            if os.name != "nt" and not os.access(c, os.X_OK):
+                try:
+                    os.chmod(c, 0o755)
+                except OSError:
+                    pass
+            return c
+    found = shutil.which("pub2json")
+    if found:
+        return found
+    raise SystemExit("pub2json not found - build it from pub2json/ (see README) or put it next to pub2idml")
+
+
+def read_events(src: str) -> list:
+    if src.lower().endswith((".jsonl", ".json")):
+        with open(src, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    r = subprocess.run([find_pub2json(), src], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, **kwargs)
+    if r.returncode != 0:
+        msg = r.stderr.decode("utf-8", "replace").strip() or f"pub2json exited with code {r.returncode}"
+        raise RuntimeError(msg)
+    return [json.loads(line) for line in r.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
 
 
 def convert(src: str, out: str, flatten: bool = False, verbose: bool = False) -> list[str]:
-    with tempfile.TemporaryDirectory() as tmp:
-        odg = src if src.lower().endswith(".odg") else pub_to_odg(src, tmp)
-        r = OdgReader(odg, verbose=verbose, flatten_groups=flatten)
-        pages = r.pages()
-        IdmlWriter(pages).write(out)
-        msgs = list(r.warnings)
-        for k, v in r.skipped.items():
-            msgs.append(f"skipped {v} unsupported element(s): {k}")
-        if verbose:
-            n = sum(count(s) for p in pages for s in p.shapes)
-            print(f"{src}: {len(pages)} page(s), {n} item(s) -> {out}")
-        return msgs
+    reader = PubReader(read_events(src), flatten_groups=flatten)
+    pages = reader.pages()
+    if not pages:
+        raise RuntimeError("no pages found")
+    IdmlWriter(pages).write(out)
+    msgs = list(reader.warnings)
+    for k, v in reader.skipped.items():
+        msgs.append(f"skipped {v} unsupported element(s): {k}")
+    if verbose:
+        n = sum(count(s) for p in pages for s in p.shapes)
+        print(f"{src}: {len(pages)} page(s), {n} item(s) -> {out}")
+    return msgs
 
 
 def count(s: Shape) -> int:
@@ -1192,12 +1003,13 @@ def count(s: Shape) -> int:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Convert Microsoft Publisher (.pub) or ODG files to IDML.")
-    ap.add_argument("input", nargs="?", help=".pub or .odg file")
+    ap = argparse.ArgumentParser(prog="pub2idml", description="Convert Microsoft Publisher (.pub) files to IDML.")
+    ap.add_argument("input", nargs="?", help=".pub file (or a .jsonl stream from pub2json)")
     ap.add_argument("-o", "--output", help="output .idml (or output directory with --batch)")
     ap.add_argument("--batch", metavar="DIR", help="convert every .pub in DIR")
     ap.add_argument("--flatten-groups", action="store_true", help="do not keep groups")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--version", action="version", version=f"pub2idml {__version__}")
     a = ap.parse_args(argv)
 
     jobs = []
@@ -1207,10 +1019,14 @@ def main(argv=None):
         for f in sorted(os.listdir(a.batch)):
             if f.lower().endswith(".pub"):
                 jobs.append((os.path.join(a.batch, f), os.path.join(outdir, os.path.splitext(f)[0] + ".idml")))
+        if not jobs:
+            print(f"no .pub files in {a.batch}", file=sys.stderr)
+            return 1
     elif a.input:
         jobs.append((a.input, a.output or os.path.splitext(a.input)[0] + ".idml"))
     else:
-        ap.error("give an input file or --batch DIR")
+        ap.print_help()
+        return 2
 
     failed = 0
     for src, out in jobs:
@@ -1224,5 +1040,27 @@ def main(argv=None):
     return 1 if failed else 0
 
 
+def _own_console_on_windows() -> bool:
+    """True when pub2idml.exe was started by double-click / drag-and-drop (it owns its console)."""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return False
+    try:
+        import ctypes
+
+        return ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 2)(), 2) <= 1
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    pause = _own_console_on_windows()
+    if pause and len(sys.argv) > 1 and all(a.lower().endswith(".pub") for a in sys.argv[1:]):
+        # drag-and-drop of several files onto pub2idml.exe
+        rc = 0
+        for f in sys.argv[1:]:
+            rc |= main([f, "-v"])
+    else:
+        rc = main()
+    if pause:
+        input("\nEnter druecken zum Beenden / press Enter to close ...")
+    sys.exit(rc)

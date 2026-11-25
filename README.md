@@ -1,28 +1,70 @@
 # pub2idml
 
-Wandelt Microsoft-Publisher-Dateien (`.pub`) in IDML um, ohne Publisher.
+Wandelt Microsoft-Publisher-Dateien (`.pub`) in IDML um – ohne Publisher und ohne LibreOffice.
 IDML öffnen DesignCraft, Adobe InDesign, Affinity Publisher und andere.
 
 ```
-.pub ──(LibreOffice headless, Import-Filter)──▶ .odg ──(pub2idml.py)──▶ .idml
+.pub ──(pub2json: libmspub)──▶ JSON-Ereignisse ──(pub2idml.py)──▶ .idml
 ```
 
-## Voraussetzungen
+`pub2json` ist ein kleines C++-Programm auf Basis von **libmspub** – derselben
+Bibliothek, mit der LibreOffice Publisher-Dateien liest (1 MB statt 300 MB LibreOffice).
+Es meldet jede Seite, Form, jeden Text und jedes Bild als eine JSON-Zeile;
+`pub2idml.py` macht daraus ein IDML-Paket.
 
-- Python 3.9+ (nur Standardbibliothek)
-- LibreOffice (kostenlos, https://www.libreoffice.org/), wird automatisch gefunden
-  (Linux `soffice`, macOS `/Applications/LibreOffice.app`, Windows `C:\Program Files\LibreOffice`)
+## Fertige Programme (Windows, macOS)
 
-## Benutzung
+Unter **Actions → build → Artifacts** (oder bei Releases unter **Releases**) liegen:
+
+- `pub2idml-windows-x64.zip`
+- `pub2idml-macos-arm64.zip` (Apple Silicon, M1–M4)
+- `pub2idml-macos-x86_64.zip` (Intel-Mac)
+
+Zip entpacken, Ordner zusammenlassen (`pub2idml` sucht `pub2json` daneben). Python oder LibreOffice
+sind **nicht** nötig.
+
+**Windows:** eine oder mehrere `.pub`-Dateien einfach auf `pub2idml.exe` ziehen – die `.idml`
+landet neben der `.pub`. Oder in der Eingabeaufforderung:
+
+```bat
+pub2idml.exe Etikett.pub
+pub2idml.exe --batch C:\Daten\Publisher -o C:\Daten\IDML
+```
+
+**macOS** (Terminal):
 
 ```bash
-python3 pub2idml.py Etikett.pub                 # -> Etikett.idml
-python3 pub2idml.py Etikett.pub -o out.idml -v
-python3 pub2idml.py --batch ./pub-ordner -o ./idml-ordner   # alle .pub eines Ordners
-python3 pub2idml.py Datei.odg                   # ODG direkt (LibreOffice-Schritt entfällt)
+xattr -dr com.apple.quarantine pub2idml-macos-arm64   # einmalig: Programme sind nicht von Apple notarisiert
+./pub2idml-macos-arm64/pub2idml Etikett.pub
 ```
 
-Option `--flatten-groups` löst Gruppen auf (falls ein Zielprogramm Gruppen schlecht verarbeitet).
+## Selbst bauen
+
+Voraussetzungen: C++-Compiler, CMake, pkg-config, libmspub (mit Entwicklerdateien), Python 3.9+.
+
+| System | libmspub installieren |
+|---|---|
+| Debian/Ubuntu | `sudo apt install libmspub-dev librevenge-dev cmake pkg-config g++` |
+| macOS | `brew install libmspub cmake pkg-config` |
+| Windows | MSYS2 UCRT64: `pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,libmspub}` |
+
+```bash
+cmake -S pub2json -B pub2json/build -DCMAKE_BUILD_TYPE=Release
+cmake --build pub2json/build
+python3 pub2idml.py Etikett.pub -v
+```
+
+`pub2idml.py` findet `pub2json` in `pub2json/build/`, neben sich selbst, im `PATH` oder über die
+Umgebungsvariable `PUB2JSON`.
+
+Zur Fehlersuche lässt sich der Zwischenschritt speichern und einzeln umwandeln:
+
+```bash
+pub2json Etikett.pub Etikett.jsonl
+python3 pub2idml.py Etikett.jsonl
+```
+
+Tests: `python3 -m unittest discover -s tests`
 
 ## Was übertragen wird
 
@@ -32,18 +74,21 @@ Option `--flatten-groups` löst Gruppen auf (falls ein Zielprogramm Gruppen schl
 | Textrahmen: Schrift, Größe, fett/kursiv, unterstrichen, Farbe, Ausrichtung, Innenabstand, vertikale Ausrichtung | ✅ |
 | Gedrehte Textrahmen | ✅ |
 | Linien, Polygone, Polylinien, Rechtecke, Ellipsen | ✅ |
-| Bézier-Pfade inkl. zusammengesetzter Pfade (SVG-Pfade aller Befehle) | ✅ |
-| Gruppen | ✅ |
+| Bézier-Pfade mit Bögen, zusammengesetzte Pfade | ✅ |
+| Gruppen | ✅ (`--flatten-groups` löst sie auf) |
 | Füllfarben, Konturfarbe, Konturstärke, gestrichelte Linien | ✅ |
-| Bilder / Bitmap-Füllungen (eingebettet) | ✅ |
+| Bilder / Bitmap-Füllungen (eingebettet: PNG, JPEG, GIF, BMP) | ✅ |
 | Verläufe | ⚠️ als Vollfarbe angenähert |
-| AutoFormen (custom-shape) | ⚠️ als umschließendes Rechteck |
-| Tabellen, Schatten, WordArt-Effekte, verkettete Textrahmen | ❌ noch nicht |
+| Tabellen, Schatten, WordArt-Effekte, verkettete Textrahmen | ❌ noch nicht (Warnung) |
 
-Fehlende Schriften (z. B. Calibri) werden vom Zielprogramm ersetzt; Schriftnamen bleiben erhalten.
+Fehlende Schriften (z. B. Calibri) ersetzt das Zielprogramm; die Schriftnamen bleiben erhalten.
 
 ## Getestet
 
-`04_publication__CHINA_Label_blau_W14.pub` (6 A3-Seiten, ~890 Objekte):
-in DesignCraft 0.21.1 geöffnet und gerendert (`designcraft-cli run --in X.idml --all-pages DIR`),
-Ergebnis visuell praktisch identisch mit dem LibreOffice-Rendering der Originaldatei.
+Eine 6-seitige A3-Etikettenzeichnung (~960 Objekte) in DesignCraft 0.21.1 geöffnet und gerendert:
+visuell praktisch identisch mit der Darstellung der Originaldatei in LibreOffice.
+
+## Lizenz
+
+MIT (siehe `LICENSE`). Mitgelieferte Bibliotheken (libmspub, librevenge, ICU, …):
+siehe `THIRD_PARTY_NOTICES.md`.
